@@ -43,22 +43,6 @@ if not ICS_URL:
         "This keeps your private calendar token out of the git repo — "
         "see the setup instructions for how to configure it."
     )
-
-# ntfy.sh custom message override — optional. If not configured, this feature
-# is silently skipped rather than failing the whole script, since it's an
-# enhancement, not core functionality.
-NTFY_TOPIC = "aaronholtomcook-flightstatus-swx1ck1s"  # public ntfy.sh topic — not treated as a
-                                                          # secret, just reasonably unique to avoid
-                                                          # colliding with unrelated ntfy.sh users.
-                                                          # Committed directly so it ships to every
-                                                          # device automatically via the git
-                                                          # auto-updater — no per-device SSH/config
-                                                          # needed. Worst case if discovered: someone
-                                                          # pushes a stray message that shows for
-                                                          # NTFY_MESSAGE_DURATION_SECONDS, then it's gone.
-NTFY_POLL_SECONDS = 30           # how often to check for a new pushed message
-NTFY_MESSAGE_DURATION_SECONDS = 15 * 60  # how long a pushed message stays on screen before reverting
-
 GROUND_REFRESH_SECONDS = 300   # how often to re-check status when there's no active flight leg (5 min)
 FLIGHT_REFRESH_SECONDS = 60    # how often to re-check a relevant flight's live/scheduled data (1 min)
 CALENDAR_CACHE_SECONDS = 24 * 60 * 60  # how long to reuse a fetched calendar before pulling fresh
@@ -191,55 +175,6 @@ def find_relevant_leg_for_today(legs, now_utc):
 
 
 _calendar_cache = {"cal": None, "fetched_at": None}
-
-# Custom message override state — a message pushed via ntfy.sh temporarily
-# replaces the normal display for NTFY_MESSAGE_DURATION_SECONDS, then reverts.
-_message_override = {"text": None, "expires_at": None, "last_id": None}
-
-
-def check_for_message_override(now_utc):
-    """Poll ntfy.sh for any new message pushed to our topic. If found, set it
-    as the active override. Silently does nothing if NTFY_TOPIC isn't set."""
-    if not NTFY_TOPIC:
-        return
-
-    try:
-        since_ts = int((now_utc - timedelta(seconds=NTFY_POLL_SECONDS * 3)).timestamp())
-        url = f"https://ntfy.sh/{NTFY_TOPIC}/json?poll=1&since={since_ts}"
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-
-        messages = []
-        for line in resp.text.strip().split("\n"):
-            if not line.strip():
-                continue
-            try:
-                messages.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-
-        actual_messages = [m for m in messages if m.get("event") == "message" and m.get("message")]
-        if not actual_messages:
-            return
-
-        latest = max(actual_messages, key=lambda m: m["time"])
-        if latest["id"] == _message_override["last_id"]:
-            return  # already showing this one
-
-        log.info(f"New ntfy message received: '{latest['message']}'")
-        _message_override["text"] = latest["message"]
-        _message_override["expires_at"] = now_utc + timedelta(seconds=NTFY_MESSAGE_DURATION_SECONDS)
-        _message_override["last_id"] = latest["id"]
-    except Exception as e:
-        log.warning(f"Couldn't check ntfy for messages ({e})", exc_info=True)
-
-
-def get_active_override(now_utc):
-    """Return the currently-active pushed message text, or None if there
-    isn't one / it has expired."""
-    if _message_override["text"] and _message_override["expires_at"] and now_utc < _message_override["expires_at"]:
-        return _message_override["text"]
-    return None
 
 
 def get_calendar(now_utc, force=False):
@@ -713,36 +648,13 @@ text_color = graphics.Color(255, 255, 0)  # yellow, for the plain-text fallback 
 pos = options.cols
 canvas = matrix.CreateFrameCanvas()
 last_refresh = time.monotonic()
-last_message_check = time.monotonic()
-
-# Briefly flash the running version on startup. Since restarts only happen on
-# deploy (via the git auto-updater) or a crash, this doubles as visual
-# confirmation that an update actually took effect — without permanently
-# using up any of the tight 64x32 layout during normal operation.
-canvas.Clear()
-version_text = git_version
-version_x = max(0, (64 - 4 * len(version_text)) // 2)
-graphics.DrawText(canvas, small_font, version_x, 18, graphics.Color(180, 180, 180), version_text)
-canvas = matrix.SwapOnVSync(canvas)
-time.sleep(2.5)
-canvas.Clear()
-canvas = matrix.SwapOnVSync(canvas)
 
 if kind == "text":
     scroll_message = data + "   "
 else:
     scroll_message = None
 
-# Tracks what was actually rendered last frame (which may be an override,
-# distinct from the underlying `kind`/`data`), so we know when to reset the
-# scroll position as we enter/leave override mode.
-last_rendered_key = None
-
 log.info(f"Display starting in '{kind}' mode. Press CTRL+C to stop.")
-if NTFY_TOPIC:
-    log.info(f"ntfy.sh custom message override enabled (polling every {NTFY_POLL_SECONDS}s)")
-else:
-    log.info("NTFY_TOPIC not set — custom message override disabled")
 
 try:
     while True:
@@ -755,42 +667,24 @@ try:
                     log.info(f"Display changed: ({kind}, {data}) -> ({new_kind}, {new_data})")
                     kind, data = new_kind, new_data
                     scroll_message = (data + "   ") if kind == "text" else None
+                    pos = options.cols  # reset scroll position on any change
                 else:
                     log.debug("Status unchanged.")
             else:
                 log.debug("Refresh returned nothing usable; keeping previous display.")
             last_refresh = time.monotonic()
 
-        if time.monotonic() - last_message_check > NTFY_POLL_SECONDS:
-            check_for_message_override(current_time())
-            last_message_check = time.monotonic()
-
-        override_text = get_active_override(current_time())
-
-        if override_text is not None:
-            render_key = ("override", override_text)
-            render_kind = "text"
-            render_message = override_text + "   "
-        else:
-            render_key = (kind, str(data))
-            render_kind = kind
-            render_message = scroll_message
-
-        if render_key != last_rendered_key:
-            pos = options.cols  # reset scroll position whenever what's shown actually changes
-            last_rendered_key = render_key
-
-        if render_kind == "board":
+        if kind == "board":
             draw_board(canvas, small_font, data)
             canvas = matrix.SwapOnVSync(canvas)
             time.sleep(0.5)  # static layout — no need to redraw every 30ms
-        elif render_kind == "status_board":
+        elif kind == "status_board":
             draw_status_board(canvas, small_font, data)
             canvas = matrix.SwapOnVSync(canvas)
             time.sleep(0.5)
         else:
             canvas.Clear()
-            len_drawn = graphics.DrawText(canvas, big_font, pos, 20, text_color, render_message)
+            len_drawn = graphics.DrawText(canvas, big_font, pos, 20, text_color, scroll_message)
             pos -= 1
             if pos + len_drawn < 0:
                 pos = options.cols
