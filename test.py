@@ -26,6 +26,7 @@ Requires: pip install requests icalendar --break-system-packages
 import argparse
 import os
 import re
+import sys
 import time
 import requests
 import json
@@ -34,7 +35,27 @@ from logging.handlers import RotatingFileHandler
 from icalendar import Calendar
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from rgbmatrix import RGBMatrix, RGBMatrixOptions, graphics
+# Detect `--dev-mode` early so we can pick the correct matrix backend
+_early_parser = argparse.ArgumentParser(add_help=False)
+_early_parser.add_argument("--dev-mode", action="store_true",
+                           help="Run in development mode (use emulator).")
+_early_args, _ = _early_parser.parse_known_args()
+
+if sys.platform == "win32":
+    from rgbmatrix_sim import RGBMatrix, RGBMatrixOptions, graphics
+    from dotenv import load_dotenv
+    load_dotenv()
+    LOG_FILE = "./dev.log"
+
+else:
+    from rgbmatrix import RGBMatrix, RGBMatrixOptions, graphics
+    # Log file lives in /tmp rather than under the home directory. RGBMatrix()
+    # drops privileges from root to the 'daemon' user once initialized, and
+    # 'daemon' often can't traverse into /home/<user>/... — /tmp is always
+    # writable by everyone, so logging keeps working after that privilege drop.
+    LOG_FILE = "/tmp/flight_status_matrix.log"
+
+
 
 ICS_URL = os.environ.get("FLEETLIFE_ICS_URL")
 if not ICS_URL:
@@ -72,11 +93,6 @@ FLIGHTSTATS_HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
-# Log file lives in /tmp rather than under the home directory. RGBMatrix()
-# drops privileges from root to the 'daemon' user once initialized, and
-# 'daemon' often can't traverse into /home/<user>/... — /tmp is always
-# writable by everyone, so logging keeps working after that privilege drop.
-LOG_FILE = "/tmp/flight_status_matrix.log"
 
 log = logging.getLogger("flight_status")
 
@@ -689,9 +705,16 @@ def current_time():
 
 log.info("Loading fonts...")
 big_font = graphics.Font()
-big_font.LoadFont("/home/aaron/Documents/rpi-rgb-led-matrix/fonts/7x13.bdf")
 small_font = graphics.Font()
-small_font.LoadFont("/home/aaron/Documents/rpi-rgb-led-matrix/fonts/4x6.bdf")
+
+if sys.platform == "win32":
+     big_font.LoadFont("./rgbmatrix_sim/fonts/7x13.bdf")
+     small_font.LoadFont("./rgbmatrix_sim/fonts/4x6.bdf")
+else:
+    big_font.LoadFont("/home/aaron/Documents/rpi-rgb-led-matrix/fonts/7x13.bdf")
+    small_font.LoadFont("/home/aaron/Documents/rpi-rgb-led-matrix/fonts/4x6.bdf")
+
+
 log.info("Fonts loaded OK.")
 
 # Fetch the initial payload BEFORE creating the RGBMatrix instance.
