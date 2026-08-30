@@ -523,14 +523,12 @@ def get_display_payload(now_utc, forced_airline=None, forced_flight_number=None)
             "icon": "swoosh",
         }
 
-    # If the leg has already landed today, don't show the flight board either
-    # — nothing live left to track. Show the same trip screen, using the
-    # airport it just landed at as the current location.
-    if leg["arr_time_utc"] < now_utc:
-        log.info(f"Leg {leg['full_flight_number']} already landed at {leg['arr_airport']} "
-                  f"— showing trip status board instead of flight board")
-        return "status_board", build_trip_status_board(leg["arr_airport"])
-
+    # Scheduled departure has passed — fetch live FlightStats data to find
+    # out the ACTUAL status. Deliberately not short-circuiting on the
+    # scheduled arrival time here: a delayed flight can still be genuinely
+    # airborne well after its scheduled arrival time, so we trust
+    # FlightStats' own status field to decide "landed" rather than assuming
+    # it from the roster's schedule alone.
     log.info(f"Relevant leg found: {leg['full_flight_number']} — fetching live/scheduled data")
     try:
         flight_json = fetch_flight_json(leg["airline"], leg["flight_number"])
@@ -539,6 +537,15 @@ def get_display_payload(now_utc, forced_airline=None, forced_flight_number=None)
         log.warning(f"Couldn't fetch live flight data for {leg['full_flight_number']} ({e}); "
                      f"showing basic trip status.", exc_info=True)
         return "text", f"Aaron is flying {leg['full_flight_number']} ({leg['dep_airport']}-{leg['arr_airport']})"
+
+    status_raw = (flight_data["status"] or "").upper()
+    actually_landed = any(word in status_raw for word in ("LANDED", "ARRIVED"))
+
+    if actually_landed:
+        arrival_airport = flight_data["arrival_iata"] or leg["arr_airport"]
+        log.info(f"Leg {leg['full_flight_number']} has actually landed at {arrival_airport} "
+                  f"(FlightStats status: '{status_raw}') — showing trip status board instead of flight board")
+        return "status_board", build_trip_status_board(arrival_airport)
 
     return "board", build_board_data(leg["full_flight_number"], flight_data, now_utc)
 
