@@ -35,6 +35,7 @@ from logging.handlers import RotatingFileHandler
 from icalendar import Calendar
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+import math
 
 # Detect --dev-mode early so we can pick the correct matrix backend before
 # the main argparse setup runs further down. parse_known_args() here so an
@@ -93,6 +94,16 @@ CALENDAR_CACHE_SECONDS = 24 * 60 * 60  # how long to reuse a fetched calendar be
                                           # a cached calendar still correctly detects the day rolling
                                           # over — only mid-day roster changes need a fresh pull)
 UK_TZ = ZoneInfo("Europe/London")  # automatically handles the GMT/BST switch
+
+# Location used to compute sunrise/sunset for auto-dimming. Hardcoded for
+# Newcastle upon Tyne, since both devices are fixed there and there's no
+# terminal access to configure per-device env vars for this.
+LOCATION_LAT = 54.9783
+LOCATION_LON = -1.6178
+
+DAY_BRIGHTNESS = 100
+NIGHT_BRIGHTNESS = 15
+BRIGHTNESS_CHECK_SECONDS = 300  # how often to re-evaluate day/night (5 min — sunset doesn't move fast)
 
 FLIGHTSTATS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -261,6 +272,69 @@ def get_active_override(now_utc):
     if _message_override["text"] and _message_override["expires_at"] and now_utc < _message_override["expires_at"]:
         return _message_override["text"]
     return None
+
+
+def calculate_sunrise_sunset(date, lat, lon):
+    """Approximate sunrise/sunset in UTC for a given date and location, using
+    the standard NOAA solar position algorithm. Pure Python (math module
+    only) — no external dependency, so no `pip install` needed on devices
+    without terminal access. Accurate to within a minute or two, which is
+    plenty for deciding day vs. night display brightness."""
+    zenith = 90.833  # official sunrise/sunset zenith, includes atmospheric refraction
+
+    def calc(is_sunrise):
+        day_of_year = date.timetuple().tm_yday
+        lng_hour = lon / 15
+        t = day_of_year + ((6 - lng_hour) / 24) if is_sunrise else day_of_year + ((18 - lng_hour) / 24)
+
+        M = (0.9856 * t) - 3.289
+        L = M + (1.916 * math.sin(math.radians(M))) + (0.020 * math.sin(math.radians(2 * M))) + 282.634
+        L = L % 360
+
+        RA = math.degrees(math.atan(0.91764 * math.tan(math.radians(L))))
+        RA = RA % 360
+        l_quadrant = (math.floor(L / 90)) * 90
+        ra_quadrant = (math.floor(RA / 90)) * 90
+        RA = (RA + (l_quadrant - ra_quadrant)) / 15
+
+        sin_dec = 0.39782 * math.sin(math.radians(L))
+        cos_dec = math.cos(math.asin(sin_dec))
+        cos_h = (math.cos(math.radians(zenith)) - (sin_dec * math.sin(math.radians(lat)))) / \
+                (cos_dec * math.cos(math.radians(lat)))
+
+        if cos_h > 1 or cos_h < -1:
+            return None  # sun never rises/sets on this date at this latitude (not relevant for the UK)
+
+        H = (360 - math.degrees(math.acos(cos_h))) if is_sunrise else math.degrees(math.acos(cos_h))
+        H = H / 15
+
+        T = H + RA - (0.06571 * t) - 6.622
+        UT = T - lng_hour
+        UT = UT % 24
+
+        hour = int(UT)
+        minute = int((UT - hour) * 60)
+        second = int((((UT - hour) * 60) - minute) * 60)
+        return datetime(date.year, date.month, date.day, hour, minute, second, tzinfo=timezone.utc)
+
+    return calc(True), calc(False)
+
+
+def get_target_brightness(now_utc):
+    """Return DAY_BRIGHTNESS or NIGHT_BRIGHTNESS depending on whether it's
+    currently after sunset / before sunrise at the configured location.
+    Falls back to day brightness if the calculation fails for any reason —
+    a wrong brightness is a minor cosmetic issue, not worth crashing over."""
+    try:
+        sunrise, sunset = calculate_sunrise_sunset(now_utc.date(), LOCATION_LAT, LOCATION_LON)
+        if sunrise is None or sunset is None:
+            return DAY_BRIGHTNESS
+        if now_utc < sunrise or now_utc > sunset:
+            return NIGHT_BRIGHTNESS
+        return DAY_BRIGHTNESS
+    except Exception as e:
+        log.warning(f"Couldn't compute sunrise/sunset ({e}); using day brightness", exc_info=True)
+        return DAY_BRIGHTNESS
 
 
 def get_calendar(now_utc, force=False):
@@ -858,12 +932,21 @@ log.info("Initializing matrix...")
 matrix = RGBMatrix(options=options)
 log.info("Matrix initialized OK.")
 
+current_brightness = get_target_brightness(current_time())
+try:
+    matrix.brightness = current_brightness
+    log.info(f"Initial brightness set to {current_brightness} "
+              f"({'night' if current_brightness == NIGHT_BRIGHTNESS else 'day'} mode)")
+except Exception as e:
+    log.warning(f"Couldn't set initial matrix brightness ({e}) — using the static options.brightness value")
+
 text_color = graphics.Color(255, 255, 0)  # yellow, for the plain-text fallback mode
 
 pos = options.cols
 canvas = matrix.CreateFrameCanvas()
 last_refresh = time.monotonic()
 last_message_check = time.monotonic()
+last_brightness_check = time.monotonic()
 
 if kind == "text":
     scroll_message = data + "   "
@@ -901,6 +984,18 @@ try:
         if time.monotonic() - last_message_check > NTFY_POLL_SECONDS:
             check_for_message_override(current_time())
             last_message_check = time.monotonic()
+
+        if time.monotonic() - last_brightness_check > BRIGHTNESS_CHECK_SECONDS:
+            target_brightness = get_target_brightness(current_time())
+            if target_brightness != current_brightness:
+                log.info(f"Brightness changing: {current_brightness} -> {target_brightness} "
+                          f"({'night' if target_brightness == NIGHT_BRIGHTNESS else 'day'} mode)")
+                try:
+                    matrix.brightness = target_brightness
+                    current_brightness = target_brightness
+                except Exception as e:
+                    log.warning(f"Couldn't update matrix brightness ({e})")
+            last_brightness_check = time.monotonic()
 
         override_text = get_active_override(current_time())
 
