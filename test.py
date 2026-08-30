@@ -35,18 +35,26 @@ from logging.handlers import RotatingFileHandler
 from icalendar import Calendar
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-# Detect `--dev-mode` early so we can pick the correct matrix backend
+
+# Detect --dev-mode early so we can pick the correct matrix backend before
+# the main argparse setup runs further down. parse_known_args() here so an
+# unrecognized --dev-mode doesn't blow up before the real parser sees it.
 _early_parser = argparse.ArgumentParser(add_help=False)
 _early_parser.add_argument("--dev-mode", action="store_true",
-                           help="Run in development mode (use emulator).")
+                            help="Run in development mode (use emulator).")
 _early_args, _ = _early_parser.parse_known_args()
 
-if sys.platform == "win32":
+# Use the emulator whenever --dev-mode is explicitly passed, OR automatically
+# on Windows (since the real rgbmatrix hardware bindings are Pi/Linux-only
+# and won't import there at all). Previously this only checked sys.platform,
+# which meant --dev-mode itself did nothing — fixed to actually honor the flag.
+USE_DEV_MODE = _early_args.dev_mode or sys.platform == "win32"
+
+if USE_DEV_MODE:
     from rgbmatrix_sim import RGBMatrix, RGBMatrixOptions, graphics
     from dotenv import load_dotenv
     load_dotenv()
     LOG_FILE = "./dev.log"
-
 else:
     from rgbmatrix import RGBMatrix, RGBMatrixOptions, graphics
     # Log file lives in /tmp rather than under the home directory. RGBMatrix()
@@ -54,8 +62,6 @@ else:
     # 'daemon' often can't traverse into /home/<user>/... — /tmp is always
     # writable by everyone, so logging keeps working after that privilege drop.
     LOG_FILE = "/tmp/flight_status_matrix.log"
-
-
 
 ICS_URL = os.environ.get("FLEETLIFE_ICS_URL")
 if not ICS_URL:
@@ -92,7 +98,6 @@ FLIGHTSTATS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
-
 
 log = logging.getLogger("flight_status")
 
@@ -282,11 +287,38 @@ def get_calendar(now_utc, force=False):
     return cached_cal
 
 
+def find_current_location(legs, now_utc):
+    """Find where Aaron currently is during a layover — the arrival airport
+    of the most recently completed leg. Returns None if no leg has
+    completed yet (e.g. the trip's report day, before the first leg departs)."""
+    completed = [l for l in legs if l["arr_time_utc"] <= now_utc]
+    if not completed:
+        return None
+    latest = max(completed, key=lambda l: l["arr_time_utc"])
+    log.debug(f"Most recently completed leg: {latest['full_flight_number']}, now at {latest['arr_airport']}")
+    return latest["arr_airport"]
+
+
+HOME_AIRPORT = "LHR"  # base airport — treated as "home", not a vacation destination
+
+
+def build_trip_status_board(location):
+    """Build the status board data for wherever Aaron currently is on a
+    trip. Home base gets the swoosh + 'AT LHR' treatment (it's not really a
+    vacation), everywhere else gets the palm tree + 'IN xxx' treatment."""
+    if location == HOME_AIRPORT:
+        return {"label": f"AT {location}", "icon": "swoosh"}
+    return {"label": f"IN {location}", "icon": "palm"}
+
+
 def get_status_and_leg(now_utc):
     """
-    Returns a tuple: (status_text, current_leg_or_None)
+    Returns a tuple: (status_text, current_leg_or_None, legs_or_None)
     current_leg is populated whenever status is "on a trip" AND today has a
-    relevant flight leg (scheduled, in-progress, or just-landed).
+    relevant flight leg (scheduled, in-progress, or just-landed). legs is the
+    full parsed leg list for the trip (needed to find the current location on
+    layover days when no leg touches today) — only populated when status is
+    "on a trip", None otherwise.
     """
     cal = get_calendar(now_utc)
 
@@ -295,7 +327,7 @@ def get_status_and_leg(now_utc):
 
     if not events:
         log.info("No events today -> Aaron is at home")
-        return "Aaron is at home", None
+        return "Aaron is at home", None, None
 
     for event in events:
         title = str(event.get("summary", ""))
@@ -306,14 +338,14 @@ def get_status_and_leg(now_utc):
             description = str(event.get("description", ""))
             legs = parse_flight_legs(description)
             relevant_leg = find_relevant_leg_for_today(legs, now_utc)
-            return "Aaron is on a trip", relevant_leg
+            return "Aaron is on a trip", relevant_leg, legs
 
         if "Simulator" in title or "Duty" in title:
             log.info(f"Training event found: '{title}' -> Aaron is on training")
-            return "Aaron is on training", None
+            return "Aaron is on training", None, None
 
     log.info("Event(s) present but none matched known patterns -> defaulting to at home")
-    return "Aaron is at home", None
+    return "Aaron is at home", None, None
 
 
 # ---------------- FLIGHTSTATS FETCH ----------------
@@ -451,7 +483,7 @@ def get_display_payload(now_utc, forced_airline=None, forced_flight_number=None)
             return "text", f"{full_number}: fetch error"
 
     try:
-        status_text, leg = get_status_and_leg(now_utc)
+        status_text, leg, legs = get_status_and_leg(now_utc)
     except Exception as e:
         log.warning(f"Couldn't fetch calendar ({e}); keeping last known status.", exc_info=True)
         return None, None
@@ -463,8 +495,41 @@ def get_display_payload(now_utc, forced_airline=None, forced_flight_number=None)
         if status_text == "Aaron is on training":
             log.info("On training -> displaying status board with 'ON A COURSE' label and swoosh icon")
             return "status_board", {"label": "ON A COURSE", "icon": "swoosh"}
+        if status_text == "Aaron is on a trip":
+            # Layover day — no leg touches today at all. Show the trip
+            # screen with wherever the most recently completed leg landed.
+            location = find_current_location(legs, now_utc) if legs else None
+            if location:
+                log.info(f"On a trip, layover day -> displaying status board for location '{location}'")
+                return "status_board", build_trip_status_board(location)
+            log.info("On a trip, no completed leg yet -> displaying generic trip status board")
+            return "status_board", {"label": "ON A TRIP", "icon": "palm"}
         log.info(f"No relevant leg -> displaying base status as scrolling text: '{status_text}'")
         return "text", status_text
+
+    # If the leg hasn't taken off yet, don't bother fetching/showing the
+    # flight board — there's nothing live to display. Show the status board
+    # (logo + text) instead, with the flight number/route and takeoff time in
+    # UK local time (handles GMT/BST automatically).
+    if leg["dep_time_utc"] > now_utc:
+        local_dep = leg["dep_time_utc"].astimezone(UK_TZ)
+        time_str = local_dep.strftime("%H:%M")
+        tz_abbrev = local_dep.tzname()
+        log.info(f"Leg {leg['full_flight_number']} hasn't departed yet "
+                  f"(takeoff at {leg['dep_time_utc']}) — showing takeoff status board instead of flight board")
+        return "status_board", {
+            "label": f'{leg["full_flight_number"]} {leg["dep_airport"]}-{leg["arr_airport"]}',
+            "sublabel": f"T/O {time_str} {tz_abbrev}",
+            "icon": "swoosh",
+        }
+
+    # If the leg has already landed today, don't show the flight board either
+    # — nothing live left to track. Show the same trip screen, using the
+    # airport it just landed at as the current location.
+    if leg["arr_time_utc"] < now_utc:
+        log.info(f"Leg {leg['full_flight_number']} already landed at {leg['arr_airport']} "
+                  f"— showing trip status board instead of flight board")
+        return "status_board", build_trip_status_board(leg["arr_airport"])
 
     log.info(f"Relevant leg found: {leg['full_flight_number']} — fetching live/scheduled data")
     try:
@@ -492,11 +557,18 @@ COLOR_DATA_ROW = (240, 168, 48)       # amber, altitude/speed
 COLOR_FLIGHT_NUM = (143, 163, 191)    # muted blue-gray
 COLOR_ETA = (255, 255, 255)           # white
 COLOR_PLACEHOLDER = (90, 90, 90)      # dim gray for "no data yet"
+COLOR_PALM_FROND = (40, 170, 90)      # green — breaks from the navy/red palette
+                                        # deliberately, since a navy/red palm
+                                        # tree wouldn't read as "vacation" at all
+COLOR_PALM_TRUNK = (140, 92, 44)      # brown
 
 ROW1_Y = 6    # route codes + roundel baseline
 ROW2_Y = 13   # status word baseline
 ROW3_Y = 20   # altitude/speed baseline
 ROW4_Y = 27   # flight number / ETA baseline
+
+STATUS_LINE1_Y = 23  # status board: flight number baseline (upcoming-flight layout)
+STATUS_LINE2_Y = 30  # status board: takeoff time baseline (upcoming-flight layout)
 
 
 def draw_filled_circle(canvas, cx, cy, radius, rgb):
@@ -520,9 +592,9 @@ def draw_wing_swoosh(canvas, cx, cy, scale=1):
     red = COLOR_ACCENT_BAR
     navy = COLOR_ROUNDEL_OUTER
     pattern = [
-        "R.............",
+        "..............",
         "RRRRRRRRRRRR..",
-        "RRRRRRRRRRRRR.",
+        ".RRRRRRRRRRRR.",
         "........RRBBB.",
         ".......BBBBB..",
         "......BBBB...."
@@ -572,6 +644,36 @@ def draw_house_icon(canvas, cx, cy, scale=2):
                     canvas.SetPixel(start_x + col_idx * scale + sx, start_y + row_idx * scale + sy, r, g, b)
 
 
+def draw_palm_icon(canvas, cx, cy, scale=2):
+    """Small pixel-art leaning palm tree (green fronds, brown trunk),
+    centered on (cx, cy) — used for the 'on a trip' vacation status board."""
+    green = COLOR_PALM_FROND
+    brown = COLOR_PALM_TRUNK
+    pattern = [
+        "..F.F.F..",
+        ".FFFFFFF.",
+        "...FFF...",
+        "....T....",
+        "....T....",
+        "...TT....",
+        "..TT.....",
+    ]
+    height = len(pattern)
+    width = len(pattern[0])
+    total_w = width * scale
+    total_h = height * scale
+    start_x = cx - total_w // 2
+    start_y = cy - total_h // 2
+    for row_idx, row in enumerate(pattern):
+        for col_idx, ch in enumerate(row):
+            if ch == '.':
+                continue
+            r, g, b = green if ch == 'F' else brown
+            for sy in range(scale):
+                for sx in range(scale):
+                    canvas.SetPixel(start_x + col_idx * scale + sx, start_y + row_idx * scale + sy, r, g, b)
+
+
 def status_color(board):
     if board["landed"]:
         return COLOR_STATUS_LANDED
@@ -616,24 +718,37 @@ def draw_board(canvas, small_font, board):
 
 
 def draw_status_board(canvas, small_font, data):
-    """Draw the simpler board layout for at-home / on-training: a bigger
-    swoosh logo (more room since there's no route-code row) with a short
-    label underneath."""
+    """Draw the simpler board layout: a bigger logo (more room since there's
+    no route-code row) with either a single centered label underneath (used
+    for at-home / on-training), or two lines (used for an upcoming flight
+    that hasn't taken off yet — flight number/route + takeoff time)."""
     canvas.Clear()
 
     # Top accent bar, same as the flight board for visual consistency
     graphics.DrawLine(canvas, 0, 0, 63, 0, graphics.Color(*COLOR_ACCENT_BAR))
 
-    # Bigger logo, centered in the upper portion — house for at-home, swoosh for training
+    # Bigger logo, centered in the upper portion — house for at-home, palm
+    # for on-a-trip, swoosh otherwise (training / upcoming flight)
     if data.get("icon") == "house":
         draw_house_icon(canvas, 32, 11, scale=2)
+    elif data.get("icon") == "palm":
+        draw_palm_icon(canvas, 32, 11, scale=2)
     else:
         draw_wing_swoosh(canvas, 32, 11, scale=2)
 
-    # Label centered underneath
     label = data["label"]
-    label_x = max(0, (64 - 4 * len(label)) // 2)
-    graphics.DrawText(canvas, small_font, label_x, ROW4_Y, graphics.Color(*COLOR_ROUTE_CODE), label)
+    sublabel = data.get("sublabel")
+
+    if sublabel:
+        # Two-line layout: flight number/route, then takeoff time below it
+        label_x = max(0, (64 - 4 * len(label)) // 2)
+        graphics.DrawText(canvas, small_font, label_x, STATUS_LINE1_Y, graphics.Color(*COLOR_ROUTE_CODE), label)
+        sub_x = max(0, (64 - 4 * len(sublabel)) // 2)
+        graphics.DrawText(canvas, small_font, sub_x, STATUS_LINE2_Y, graphics.Color(*COLOR_ETA), sublabel)
+    else:
+        # Single-line layout: just the label, centered on the usual row
+        label_x = max(0, (64 - 4 * len(label)) // 2)
+        graphics.DrawText(canvas, small_font, label_x, ROW4_Y, graphics.Color(*COLOR_ROUTE_CODE), label)
 
 
 # ---------------- MATRIX SETUP ----------------
@@ -661,6 +776,14 @@ parser.add_argument(
     action="store_true",
     help="Enable verbose DEBUG-level logging (shows every parsed field, raw "
          "candidate lists, etc.) in addition to the normal INFO-level logs.",
+)
+parser.add_argument(
+    "--dev-mode",
+    action="store_true",
+    help="Run using the rgbmatrix_sim emulator instead of real hardware. "
+         "Already detected earlier (before this parser runs) to pick the "
+         "correct backend — registered here too just so it doesn't get "
+         "rejected as an unrecognized argument.",
 )
 args = parser.parse_args()
 
@@ -706,15 +829,12 @@ def current_time():
 log.info("Loading fonts...")
 big_font = graphics.Font()
 small_font = graphics.Font()
-
-if sys.platform == "win32":
-     big_font.LoadFont("./rgbmatrix_sim/fonts/7x13.bdf")
-     small_font.LoadFont("./rgbmatrix_sim/fonts/4x6.bdf")
+if USE_DEV_MODE:
+    big_font.LoadFont("./rgbmatrix_sim/fonts/7x13.bdf")
+    small_font.LoadFont("./rgbmatrix_sim/fonts/4x6.bdf")
 else:
     big_font.LoadFont("/home/aaron/Documents/rpi-rgb-led-matrix/fonts/7x13.bdf")
     small_font.LoadFont("/home/aaron/Documents/rpi-rgb-led-matrix/fonts/4x6.bdf")
-
-
 log.info("Fonts loaded OK.")
 
 # Fetch the initial payload BEFORE creating the RGBMatrix instance.

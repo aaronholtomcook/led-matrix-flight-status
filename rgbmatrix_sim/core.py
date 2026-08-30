@@ -63,3 +63,8 @@ class RGBMatrix:
                 )
                 pygame.draw.rect(self.screen, (r, g, b), rect)
         pygame.display.flip()
+
+
+    def Clear(self):
+        self.canvas.Clear()
+        self._draw()
