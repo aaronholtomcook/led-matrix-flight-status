@@ -102,7 +102,7 @@ LOCATION_LAT = 54.9783
 LOCATION_LON = -1.6178
 
 DAY_BRIGHTNESS = 100
-NIGHT_BRIGHTNESS = 15
+NIGHT_BRIGHTNESS = 50
 BRIGHTNESS_CHECK_SECONDS = 300  # how often to re-evaluate day/night (5 min — sunset doesn't move fast)
 
 FLIGHTSTATS_HEADERS = {
@@ -798,11 +798,13 @@ def draw_board(canvas, small_font, board):
         graphics.DrawText(canvas, small_font, 64 - 1 - 4 * len(eta_text), ROW4_Y, graphics.Color(*COLOR_ETA), eta_text)
 
 
-def draw_status_board(canvas, small_font, data):
+def draw_status_board(canvas, small_font, data, now_utc=None):
     """Draw the simpler board layout: a bigger logo (more room since there's
     no route-code row) with either a single centered label underneath (used
     for at-home / on-training), or two lines (used for an upcoming flight
-    that hasn't taken off yet — flight number/route + takeoff time)."""
+    that hasn't taken off yet — flight number/route + takeoff time).
+    For the at-home screen specifically, also shows the date (top-left) and
+    time (top-right) in UK local time, flanking the house icon."""
     canvas.Clear()
 
     # Top accent bar, same as the flight board for visual consistency
@@ -810,12 +812,24 @@ def draw_status_board(canvas, small_font, data):
 
     # Bigger logo, centered in the upper portion — house for at-home, palm
     # for on-a-trip, swoosh otherwise (training / upcoming flight)
-    if data.get("icon") == "house":
+    icon = data.get("icon")
+    if icon == "house":
         draw_house_icon(canvas, 32, 11, scale=2)
-    elif data.get("icon") == "palm":
+    elif icon == "palm":
         draw_palm_icon(canvas, 32, 11, scale=2)
     else:
         draw_wing_swoosh(canvas, 32, 11, scale=2)
+
+    # At-home only: date top-left, time top-right, flanking the house icon.
+    # Redrawn every frame using the live clock, so it just stays current —
+    # the status board already redraws every 0.5s in the main loop.
+    if icon == "house" and now_utc is not None:
+        local_now = now_utc.astimezone(UK_TZ)
+        date_str = local_now.strftime("%d/%m")
+        time_str = local_now.strftime("%H:%M")
+        graphics.DrawText(canvas, small_font, 2, ROW1_Y, graphics.Color(*COLOR_ROUTE_CODE), date_str)
+        time_x = 64 - 1 - 4 * len(time_str)
+        graphics.DrawText(canvas, small_font, time_x, ROW1_Y, graphics.Color(*COLOR_ROUTE_CODE), time_str)
 
     label = data["label"]
     sublabel = data.get("sublabel")
@@ -1017,7 +1031,7 @@ try:
             canvas = matrix.SwapOnVSync(canvas)
             time.sleep(0.5)  # static layout — no need to redraw every 30ms
         elif render_kind == "status_board":
-            draw_status_board(canvas, small_font, data)
+            draw_status_board(canvas, small_font, data, current_time())
             canvas = matrix.SwapOnVSync(canvas)
             time.sleep(0.5)
         else:
