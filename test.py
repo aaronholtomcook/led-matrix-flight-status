@@ -803,30 +803,35 @@ def draw_status_board(canvas, small_font, data, now_utc=None):
     no route-code row) with either a single centered label underneath (used
     for at-home / on-training), or two lines (used for an upcoming flight
     that hasn't taken off yet — flight number/route + takeoff time).
-    For the at-home screen specifically, also shows the date (top-left) and
-    time (top-right) in UK local time, flanking the house icon."""
+    Always shows the date (top-left) and time (top-right) in UK local time,
+    flanking the icon. The time's colon blinks on/off each second so it's
+    visually clear the clock is live, not a frozen static screen."""
     canvas.Clear()
 
     # Top accent bar, same as the flight board for visual consistency
     graphics.DrawLine(canvas, 0, 0, 63, 0, graphics.Color(*COLOR_ACCENT_BAR))
 
     # Bigger logo, centered in the upper portion — house for at-home, palm
-    # for on-a-trip, swoosh otherwise (training / upcoming flight)
+    # for on-a-trip. Swoosh (training / upcoming flight) stays at its
+    # original compact size here, same as it uses on the flight board —
+    # at the bigger scale=2 used by house/palm it would collide with the
+    # clock text in the corners, since it's a wider shape to begin with.
     icon = data.get("icon")
     if icon == "house":
         draw_house_icon(canvas, 32, 11, scale=2)
     elif icon == "palm":
         draw_palm_icon(canvas, 32, 11, scale=2)
     else:
-        draw_wing_swoosh(canvas, 32, 11, scale=2)
+        draw_wing_swoosh(canvas, 32, 11, scale=1)
 
-    # At-home only: date top-left, time top-right, flanking the house icon.
+    # Date top-left, time top-right, on every status board.
     # Redrawn every frame using the live clock, so it just stays current —
     # the status board already redraws every 0.5s in the main loop.
-    if icon == "house" and now_utc is not None:
+    if now_utc is not None:
         local_now = now_utc.astimezone(UK_TZ)
         date_str = local_now.strftime("%d/%m")
-        time_str = local_now.strftime("%H:%M")
+        colon = ":" if local_now.second % 2 == 0 else " "
+        time_str = local_now.strftime(f"%H{colon}%M")
         graphics.DrawText(canvas, small_font, 2, ROW1_Y, graphics.Color(*COLOR_ROUTE_CODE), date_str)
         time_x = 64 - 1 - 4 * len(time_str)
         graphics.DrawText(canvas, small_font, time_x, ROW1_Y, graphics.Color(*COLOR_ROUTE_CODE), time_str)
