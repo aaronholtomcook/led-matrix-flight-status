@@ -824,15 +824,20 @@ def draw_status_board(canvas, small_font, data, now_utc=None):
     else:
         draw_wing_swoosh(canvas, 32, 11, scale=1)
 
-    # Date top-left, time top-right, on every status board.
+    # Date top-left (day number, then month abbreviation stacked below it),
+    # time top-right, on every status board. A narrow two-line date column
+    # stays clear of the icon horizontally regardless of vertical extent,
+    # avoiding the width crunch a single wider line ran into.
     # Redrawn every frame using the live clock, so it just stays current —
     # the status board already redraws every 0.5s in the main loop.
     if now_utc is not None:
         local_now = now_utc.astimezone(UK_TZ)
-        date_str = local_now.strftime("%d %b")
+        day_str = str(local_now.day)      # no leading zero, e.g. "1" not "01"
+        month_str = local_now.strftime("%b")  # e.g. "Sep"
         colon = ":" if local_now.second % 2 == 0 else " "
         time_str = local_now.strftime(f"%H{colon}%M")
-        graphics.DrawText(canvas, small_font, 2, ROW1_Y, graphics.Color(*COLOR_ROUTE_CODE), date_str)
+        graphics.DrawText(canvas, small_font, 2, ROW1_Y, graphics.Color(*COLOR_ROUTE_CODE), day_str)
+        graphics.DrawText(canvas, small_font, 2, ROW2_Y, graphics.Color(*COLOR_ROUTE_CODE), month_str)
         time_x = 64 - 1 - 4 * len(time_str)
         graphics.DrawText(canvas, small_font, time_x, ROW1_Y, graphics.Color(*COLOR_ROUTE_CODE), time_str)
 
