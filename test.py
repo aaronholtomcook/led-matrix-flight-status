@@ -829,7 +829,7 @@ def draw_status_board(canvas, small_font, data, now_utc=None):
     # the status board already redraws every 0.5s in the main loop.
     if now_utc is not None:
         local_now = now_utc.astimezone(UK_TZ)
-        date_str = local_now.strftime("%d/%m")
+        date_str = local_now.strftime("%d %b")
         colon = ":" if local_now.second % 2 == 0 else " "
         time_str = local_now.strftime(f"%H{colon}%M")
         graphics.DrawText(canvas, small_font, 2, ROW1_Y, graphics.Color(*COLOR_ROUTE_CODE), date_str)
