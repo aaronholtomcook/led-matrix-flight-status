@@ -88,6 +88,10 @@ NTFY_POLL_SECONDS = 30           # how often to check for a new pushed message
 NTFY_MESSAGE_DURATION_SECONDS = 15 * 60  # how long a pushed message stays on screen before reverting
 
 GROUND_REFRESH_SECONDS = 300   # how often to re-check status when there's no active flight leg (5 min)
+HOME_CYCLE_INTERVAL_SECONDS = 60   # how often the at-home screen shows the "next flight" interlude
+HOME_WIPE_DURATION_SECONDS = 1.0   # how long each wipe transition takes
+HOME_ANIMATION_TICK = 0.03         # frame interval during wipes/scrolling — smooth, matches the
+                                      # existing plain-text scroll rate elsewhere in the script
 FLIGHT_REFRESH_SECONDS = 60    # how often to re-check a relevant flight's live/scheduled data (1 min)
 CALENDAR_CACHE_SECONDS = 24 * 60 * 60  # how long to reuse a fetched calendar before pulling fresh
                                           # (the ICS feed already contains events across many days, so
@@ -385,6 +389,63 @@ def build_trip_status_board(location):
     return {"label": f"IN {location}", "icon": "palm"}
 
 
+def ordinal_day(n):
+    """3 -> '3rd', 11 -> '11th', 21 -> '21st', etc."""
+    if 11 <= (n % 100) <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def find_next_trip_leg(cal, now_utc):
+    """Look ahead (beyond today) for the next upcoming trip event, and
+    return its first leg (dep/arr/departure time), or None if there isn't
+    one — e.g. nothing currently scheduled, or the roster doesn't reach
+    that far ahead yet."""
+    today = now_utc.date()
+    upcoming = []
+    for component in cal.walk("VEVENT"):
+        title = str(component.get("summary", ""))
+        if "✈️" not in title:
+            continue
+        dtstart = component.get("dtstart").dt
+        start_date = dtstart if not isinstance(dtstart, datetime) else dtstart.date()
+        if start_date > today:
+            upcoming.append((start_date, component))
+
+    if not upcoming:
+        log.debug("No upcoming trip events found in calendar")
+        return None
+
+    upcoming.sort(key=lambda x: x[0])
+    _, next_event = upcoming[0]
+    description = str(next_event.get("description", ""))
+    legs = parse_flight_legs(description)
+    if not legs:
+        log.debug("Next upcoming trip event had no parseable legs")
+        return None
+
+    first_leg = min(legs, key=lambda l: l["dep_time_utc"])
+    log.debug(f"Next trip: {first_leg['full_flight_number']} "
+               f"{first_leg['dep_airport']}-{first_leg['arr_airport']} on {first_leg['dep_time_utc']}")
+    return first_leg
+
+
+def build_next_flight_message(leg):
+    """Build the 'Next Flight: BA249 LHR-GIG 13th Sep 21:45' scrolling
+    message from a leg, split into parts so the flight number can be drawn
+    in a different color (red) than the rest of the line."""
+    local_dep = leg["dep_time_utc"].astimezone(UK_TZ)
+    date_str = f"{ordinal_day(local_dep.day)} {local_dep.strftime('%b')}"
+    time_str = local_dep.strftime("%H:%M")
+    return {
+        "prefix": "Next Flight: ",
+        "flight_num": leg["full_flight_number"],
+        "suffix": f" {leg['dep_airport']}-{leg['arr_airport']} {date_str} {time_str}   ",
+    }
+
+
 def get_status_and_leg(now_utc):
     """
     Returns a tuple: (status_text, current_leg_or_None, legs_or_None)
@@ -651,6 +712,10 @@ ROW4_Y = 27   # flight number / ETA baseline
 STATUS_LINE1_Y = 23  # status board: flight number baseline (upcoming-flight layout)
 STATUS_LINE2_Y = 30  # status board: takeoff time baseline (upcoming-flight layout)
 
+LABEL_ROW_Y_START = 20  # vertical band covering just the single-line label row
+LABEL_ROW_Y_END = 28    # (used to scope the at-home wipe/scroll to that row only,
+                          # leaving the icon/date/time above it untouched)
+
 
 def draw_filled_circle(canvas, cx, cy, radius, rgb):
     """Draw a filled circle by setting individual pixels — the graphics
@@ -798,14 +863,31 @@ def draw_board(canvas, small_font, board):
         graphics.DrawText(canvas, small_font, 64 - 1 - 4 * len(eta_text), ROW4_Y, graphics.Color(*COLOR_ETA), eta_text)
 
 
-def draw_status_board(canvas, small_font, data, now_utc=None):
+def draw_black_overlay(canvas, x_start, x_end, y_start=0, y_end=31):
+    """Black out columns x_start to x_end (inclusive) within rows y_start to
+    y_end (inclusive; defaults to full height). Used to implement wipe
+    transitions: draw the normal content first, then paint over the hidden
+    portion with black — SetPixel calls are applied in order, so this
+    correctly erases whatever was drawn just before it, including
+    text/lines drawn via the graphics module."""
+    if x_end < x_start:
+        return
+    for x in range(max(0, x_start), min(63, x_end) + 1):
+        for y in range(max(0, y_start), min(31, y_end) + 1):
+            canvas.SetPixel(x, y, 0, 0, 0)
+
+
+def draw_status_board(canvas, small_font, data, now_utc=None, hide_label=False):
     """Draw the simpler board layout: a bigger logo (more room since there's
     no route-code row) with either a single centered label underneath (used
     for at-home / on-training), or two lines (used for an upcoming flight
     that hasn't taken off yet — flight number/route + takeoff time).
     Always shows the date (top-left) and time (top-right) in UK local time,
     flanking the icon. The time's colon blinks on/off each second so it's
-    visually clear the clock is live, not a frozen static screen."""
+    visually clear the clock is live, not a frozen static screen.
+    hide_label=True skips drawing the label/sublabel entirely — used by the
+    at-home 'next flight' interlude, which wipes/replaces only that text
+    while everything else on screen stays untouched."""
     canvas.Clear()
 
     # Top accent bar, same as the flight board for visual consistency
@@ -832,7 +914,7 @@ def draw_status_board(canvas, small_font, data, now_utc=None):
     # the status board already redraws every 0.5s in the main loop.
     if now_utc is not None:
         local_now = now_utc.astimezone(UK_TZ)
-        day_str = str(local_now.day)      # no leading zero, e.g. "1" not "01"
+        day_str = ordinal_day(local_now.day)  # e.g. "30th", "1st", "3rd", "22nd"
         month_str = local_now.strftime("%b")  # e.g. "Sep"
         colon = ":" if local_now.second % 2 == 0 else " "
         time_str = local_now.strftime(f"%H{colon}%M")
@@ -843,6 +925,9 @@ def draw_status_board(canvas, small_font, data, now_utc=None):
 
     label = data["label"]
     sublabel = data.get("sublabel")
+
+    if hide_label:
+        return
 
     if sublabel:
         # Two-line layout: flight number/route, then takeoff time below it
@@ -982,6 +1067,18 @@ else:
 # scroll position as we enter/leave override mode.
 last_rendered_key = None
 
+# At-home "next flight" interlude: a sub-state machine independent of
+# kind/data, since it animates on top of the same underlying AT HOME status
+# without that status itself changing. Reset to "normal" whenever the
+# underlying status actually changes (see render_key check below), so an
+# in-progress animation never gets stuck if e.g. the pilot's status changes
+# mid-wipe.
+home_anim_phase = "normal"       # normal | wipe_out | scroll | wipe_in
+home_anim_phase_start = None
+home_next_cycle_time = time.monotonic() + HOME_CYCLE_INTERVAL_SECONDS
+home_scroll_pos = options.cols
+home_next_flight_msg = None
+
 log.info(f"Display starting in '{kind}' mode. Press CTRL+C to stop.")
 if NTFY_TOPIC:
     log.info(f"ntfy.sh custom message override enabled (polling every {NTFY_POLL_SECONDS}s)")
@@ -1035,6 +1132,79 @@ try:
         if render_key != last_rendered_key:
             pos = options.cols  # reset scroll position whenever what's shown actually changes
             last_rendered_key = render_key
+            if home_anim_phase != "normal":
+                log.debug("Underlying status changed mid at-home animation — resetting to normal")
+            home_anim_phase = "normal"
+            home_next_cycle_time = time.monotonic() + HOME_CYCLE_INTERVAL_SECONDS
+
+        is_home_screen = (render_kind == "status_board" and data.get("icon") == "house"
+                            and override_text is None)
+
+        if is_home_screen and home_anim_phase != "normal":
+            # Mid-interlude: wipe out just the "AT HOME" text (icon/date/time
+            # stay visible throughout), scroll "Next Flight: ..." in at the
+            # same size/position as that text, then wipe it back in.
+            now_mono = time.monotonic()
+
+            if home_anim_phase == "wipe_out":
+                elapsed = now_mono - home_anim_phase_start
+                progress = min(elapsed / HOME_WIPE_DURATION_SECONDS, 1.0)
+                draw_status_board(canvas, small_font, data, current_time())
+                draw_black_overlay(canvas, 0, int(64 * progress) - 1,
+                                     LABEL_ROW_Y_START, LABEL_ROW_Y_END)
+                canvas = matrix.SwapOnVSync(canvas)
+                if progress >= 1.0:
+                    home_anim_phase = "scroll"
+                    home_scroll_pos = options.cols
+                time.sleep(HOME_ANIMATION_TICK)
+
+            elif home_anim_phase == "scroll":
+                draw_status_board(canvas, small_font, data, current_time(), hide_label=True)
+                x = home_scroll_pos
+                w1 = graphics.DrawText(canvas, small_font, x, ROW4_Y,
+                                         graphics.Color(*COLOR_ROUTE_CODE), home_next_flight_msg["prefix"])
+                x += w1
+                w2 = graphics.DrawText(canvas, small_font, x, ROW4_Y,
+                                         graphics.Color(*COLOR_ACCENT_BAR), home_next_flight_msg["flight_num"])
+                x += w2
+                w3 = graphics.DrawText(canvas, small_font, x, ROW4_Y,
+                                         graphics.Color(*COLOR_ROUTE_CODE), home_next_flight_msg["suffix"])
+                len_drawn = w1 + w2 + w3
+                home_scroll_pos -= 1
+                canvas = matrix.SwapOnVSync(canvas)
+                if home_scroll_pos + len_drawn < 0:
+                    home_anim_phase = "wipe_in"
+                    home_anim_phase_start = time.monotonic()
+                time.sleep(HOME_ANIMATION_TICK)
+
+            elif home_anim_phase == "wipe_in":
+                elapsed = now_mono - home_anim_phase_start
+                progress = min(elapsed / HOME_WIPE_DURATION_SECONDS, 1.0)
+                draw_status_board(canvas, small_font, data, current_time())
+                draw_black_overlay(canvas, int(64 * progress), 63,
+                                     LABEL_ROW_Y_START, LABEL_ROW_Y_END)
+                canvas = matrix.SwapOnVSync(canvas)
+                if progress >= 1.0:
+                    home_anim_phase = "normal"
+                    home_next_cycle_time = time.monotonic() + HOME_CYCLE_INTERVAL_SECONDS
+                time.sleep(HOME_ANIMATION_TICK)
+
+            continue  # skip the normal rendering branch below while mid-interlude
+
+        if is_home_screen and time.monotonic() >= home_next_cycle_time:
+            # Time for the next interlude — look ahead for the next trip.
+            cal_for_lookup = get_calendar(current_time())
+            next_leg = find_next_trip_leg(cal_for_lookup, current_time())
+            if next_leg:
+                home_next_flight_msg = build_next_flight_message(next_leg)
+                full_text = home_next_flight_msg["prefix"] + home_next_flight_msg["flight_num"] + home_next_flight_msg["suffix"]
+                log.info(f"At-home interlude starting: '{full_text.strip()}'")
+                home_anim_phase = "wipe_out"
+                home_anim_phase_start = time.monotonic()
+                continue  # start animating next iteration
+            else:
+                log.debug("No next flight found for interlude — skipping this cycle")
+                home_next_cycle_time = time.monotonic() + HOME_CYCLE_INTERVAL_SECONDS
 
         if render_kind == "board":
             draw_board(canvas, small_font, data)
