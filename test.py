@@ -92,6 +92,8 @@ HOME_CYCLE_INTERVAL_SECONDS = 60   # how often the at-home screen shows the "nex
 HOME_WIPE_DURATION_SECONDS = 1.0   # how long each wipe transition takes
 HOME_ANIMATION_TICK = 0.03         # frame interval during wipes/scrolling — smooth, matches the
                                       # existing plain-text scroll rate elsewhere in the script
+TRIP_LIST_CYCLE_INTERVAL_SECONDS = 300  # how often the "Coming Up" full-screen trip list appears (5 min)
+TRIP_LIST_DISPLAY_SECONDS = 60          # how long it stays up
 FLIGHT_REFRESH_SECONDS = 60    # how often to re-check a relevant flight's live/scheduled data (1 min)
 CALENDAR_CACHE_SECONDS = 24 * 60 * 60  # how long to reuse a fetched calendar before pulling fresh
                                           # (the ICS feed already contains events across many days, so
@@ -444,6 +446,53 @@ def build_next_flight_message(leg):
         "flight_num": leg["full_flight_number"],
         "suffix": f" {leg['dep_airport']}-{leg['arr_airport']} {date_str} {time_str}   ",
     }
+
+
+def find_upcoming_trips_summary(cal, now_utc, max_count=3):
+    """Find the next few upcoming trip events (beyond today). For each,
+    return the overall start/end date (first leg's departure to last leg's
+    arrival) and the first leg's destination — used for the 'Coming Up'
+    screen's compact trip list."""
+    today = now_utc.date()
+    upcoming = []
+    for component in cal.walk("VEVENT"):
+        title = str(component.get("summary", ""))
+        if "✈️" not in title:
+            continue
+        dtstart = component.get("dtstart").dt
+        start_date = dtstart if not isinstance(dtstart, datetime) else dtstart.date()
+        if start_date > today:
+            upcoming.append((start_date, component))
+
+    upcoming.sort(key=lambda x: x[0])
+    summaries = []
+    for _, event in upcoming[:max_count]:
+        description = str(event.get("description", ""))
+        legs = parse_flight_legs(description)
+        if not legs:
+            continue
+        first_leg = min(legs, key=lambda l: l["dep_time_utc"])
+        last_leg = max(legs, key=lambda l: l["arr_time_utc"])
+        summaries.append({
+            "start": first_leg["dep_time_utc"].astimezone(UK_TZ),
+            "end": last_leg["arr_time_utc"].astimezone(UK_TZ),
+            "destination": first_leg["arr_airport"],
+        })
+
+    log.debug(f"Found {len(summaries)} upcoming trip(s) for the Coming Up screen")
+    return summaries
+
+
+def format_trip_summary_line(trip):
+    """'1-3 Sep GIG' (or '30 Aug-2 Sep GIG' if it spans two months) — kept
+    compact (no ordinal suffixes, minimal spacing) so up to three of these
+    fit on screen simultaneously, unlike the wordier Next Flight message."""
+    start, end = trip["start"], trip["end"]
+    if start.month == end.month:
+        date_part = f"{start.day}-{end.day} {end.strftime('%b')}"
+    else:
+        date_part = f"{start.day} {start.strftime('%b')}-{end.day} {end.strftime('%b')}"
+    return f"{date_part} {trip['destination']}"
 
 
 def get_status_and_leg(now_utc):
@@ -941,6 +990,22 @@ def draw_status_board(canvas, small_font, data, now_utc=None, hide_label=False):
         graphics.DrawText(canvas, small_font, label_x, ROW4_Y, graphics.Color(*COLOR_ROUTE_CODE), label)
 
 
+def draw_coming_up_screen(canvas, small_font, trips):
+    """Full-screen takeover replacing the entire at-home display: a
+    'COMING UP' heading with a small swoosh logo in the top-right corner,
+    then up to three upcoming trips listed below it (one per row, reusing
+    the same ROW2_Y/ROW3_Y/ROW4_Y grid the flight board uses)."""
+    canvas.Clear()
+    graphics.DrawLine(canvas, 0, 0, 63, 0, graphics.Color(*COLOR_ACCENT_BAR))
+    graphics.DrawText(canvas, small_font, 1, ROW1_Y, graphics.Color(*COLOR_ROUTE_CODE), "COMING UP")
+    draw_wing_swoosh(canvas, 56, 7, scale=1)
+
+    trip_rows = [ROW2_Y, ROW3_Y, ROW4_Y]
+    for row_y, trip in zip(trip_rows, trips):
+        line = format_trip_summary_line(trip)
+        graphics.DrawText(canvas, small_font, 1, row_y, graphics.Color(*COLOR_ETA), line)
+
+
 # ---------------- MATRIX SETUP ----------------
 parser = argparse.ArgumentParser(description="Scroll Aaron's flight/duty status on the LED matrix.")
 parser.add_argument(
@@ -1079,6 +1144,15 @@ home_next_cycle_time = time.monotonic() + HOME_CYCLE_INTERVAL_SECONDS
 home_scroll_pos = options.cols
 home_next_flight_msg = None
 
+# "Coming Up" trip-list screen: a separate, independent interlude from the
+# above — a full-screen takeover rather than a wipe/scroll on the label row.
+# Mutually exclusive with the interlude above (see the render loop): each
+# only starts when the other is currently idle, so they never overlap.
+home_list_active = False
+home_list_end_time = None
+home_list_next_cycle_time = time.monotonic() + TRIP_LIST_CYCLE_INTERVAL_SECONDS
+home_list_trips = None
+
 log.info(f"Display starting in '{kind}' mode. Press CTRL+C to stop.")
 if NTFY_TOPIC:
     log.info(f"ntfy.sh custom message override enabled (polling every {NTFY_POLL_SECONDS}s)")
@@ -1136,9 +1210,27 @@ try:
                 log.debug("Underlying status changed mid at-home animation — resetting to normal")
             home_anim_phase = "normal"
             home_next_cycle_time = time.monotonic() + HOME_CYCLE_INTERVAL_SECONDS
+            if home_list_active:
+                log.debug("Underlying status changed mid Coming Up screen — resetting")
+            home_list_active = False
+            home_list_next_cycle_time = time.monotonic() + TRIP_LIST_CYCLE_INTERVAL_SECONDS
 
         is_home_screen = (render_kind == "status_board" and data.get("icon") == "house"
                             and override_text is None)
+
+        if home_list_active:
+            # Full-screen "Coming Up" takeover — highest priority, blocks
+            # everything else (including the next-flight interlude) until
+            # its display time is up.
+            if time.monotonic() >= home_list_end_time:
+                home_list_active = False
+                home_list_next_cycle_time = time.monotonic() + TRIP_LIST_CYCLE_INTERVAL_SECONDS
+                # falls through to normal rendering below, this same iteration
+            else:
+                draw_coming_up_screen(canvas, small_font, home_list_trips)
+                canvas = matrix.SwapOnVSync(canvas)
+                time.sleep(0.5)
+                continue
 
         if is_home_screen and home_anim_phase != "normal":
             # Mid-interlude: wipe out just the "AT HOME" text (icon/date/time
@@ -1190,6 +1282,21 @@ try:
                 time.sleep(HOME_ANIMATION_TICK)
 
             continue  # skip the normal rendering branch below while mid-interlude
+
+        if (is_home_screen and home_anim_phase == "normal" and not home_list_active
+                and time.monotonic() >= home_list_next_cycle_time):
+            # Time for the "Coming Up" full-screen trip list.
+            cal_for_lookup = get_calendar(current_time())
+            trips = find_upcoming_trips_summary(cal_for_lookup, current_time(), max_count=3)
+            if trips:
+                home_list_trips = trips
+                home_list_active = True
+                home_list_end_time = time.monotonic() + TRIP_LIST_DISPLAY_SECONDS
+                log.info(f"Showing Coming Up screen with {len(trips)} upcoming trip(s)")
+                continue  # start showing it next iteration
+            else:
+                log.debug("No upcoming trips found for Coming Up screen — skipping this cycle")
+                home_list_next_cycle_time = time.monotonic() + TRIP_LIST_CYCLE_INTERVAL_SECONDS
 
         if is_home_screen and time.monotonic() >= home_next_cycle_time:
             # Time for the next interlude — look ahead for the next trip.
