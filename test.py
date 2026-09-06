@@ -92,7 +92,7 @@ HOME_CYCLE_INTERVAL_SECONDS = 60   # how often the at-home screen shows the "nex
 HOME_WIPE_DURATION_SECONDS = 1.0   # how long each wipe transition takes
 HOME_ANIMATION_TICK = 0.03         # frame interval during wipes/scrolling — smooth, matches the
                                       # existing plain-text scroll rate elsewhere in the script
-TRIP_LIST_CYCLE_INTERVAL_SECONDS = 300  # how often the "Coming Up" full-screen trip list appears (5 min)
+TRIP_LIST_CYCLE_INTERVAL_SECONDS = 10  # how often the "Coming Up" full-screen trip list appears (5 min)
 TRIP_LIST_DISPLAY_SECONDS = 60          # how long it stays up
 FLIGHT_REFRESH_SECONDS = 60    # how often to re-check a relevant flight's live/scheduled data (1 min)
 CALENDAR_CACHE_SECONDS = 24 * 60 * 60  # how long to reuse a fetched calendar before pulling fresh
@@ -990,13 +990,21 @@ def draw_status_board(canvas, small_font, data, now_utc=None, hide_label=False):
         graphics.DrawText(canvas, small_font, label_x, ROW4_Y, graphics.Color(*COLOR_ROUTE_CODE), label)
 
 
-def draw_coming_up_screen(canvas, small_font, trips):
+def draw_coming_up_screen(canvas, small_font, trips, progress=0.0):
     """Full-screen takeover replacing the entire at-home display: a
     'COMING UP' heading with a small swoosh logo in the top-right corner,
     then up to three upcoming trips listed below it (one per row, reusing
-    the same ROW2_Y/ROW3_Y/ROW4_Y grid the flight board uses)."""
+    the same ROW2_Y/ROW3_Y/ROW4_Y grid the flight board uses).
+    The top bar doubles as a progress indicator: it fills in blue from left
+    to right as `progress` (0.0 to 1.0) increases, reaching fully blue right
+    as the screen is about to revert back to the normal at-home display."""
     canvas.Clear()
-    graphics.DrawLine(canvas, 0, 0, 63, 0, graphics.Color(*COLOR_ACCENT_BAR))
+
+    blue_end = int(64 * max(0.0, min(progress, 1.0)))
+    for x in range(64):
+        color = COLOR_ROUNDEL_OUTER if x < blue_end else COLOR_ACCENT_BAR
+        canvas.SetPixel(x, 0, *color)
+
     graphics.DrawText(canvas, small_font, 1, ROW1_Y, graphics.Color(*COLOR_ROUTE_CODE), "COMING UP")
     draw_wing_swoosh(canvas, 56, 7, scale=1)
 
@@ -1227,7 +1235,9 @@ try:
                 home_list_next_cycle_time = time.monotonic() + TRIP_LIST_CYCLE_INTERVAL_SECONDS
                 # falls through to normal rendering below, this same iteration
             else:
-                draw_coming_up_screen(canvas, small_font, home_list_trips)
+                remaining = home_list_end_time - time.monotonic()
+                progress = 1.0 - max(0.0, remaining) / TRIP_LIST_DISPLAY_SECONDS
+                draw_coming_up_screen(canvas, small_font, home_list_trips, progress)
                 canvas = matrix.SwapOnVSync(canvas)
                 time.sleep(0.5)
                 continue
