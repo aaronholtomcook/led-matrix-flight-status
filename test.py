@@ -92,7 +92,7 @@ HOME_CYCLE_INTERVAL_SECONDS = 60   # how often the at-home screen shows the "nex
 HOME_WIPE_DURATION_SECONDS = 1.0   # how long each wipe transition takes
 HOME_ANIMATION_TICK = 0.03         # frame interval during wipes/scrolling — smooth, matches the
                                       # existing plain-text scroll rate elsewhere in the script
-TRIP_LIST_CYCLE_INTERVAL_SECONDS = 10  # how often the "Coming Up" full-screen trip list appears (5 min)
+TRIP_LIST_CYCLE_INTERVAL_SECONDS = 300  # how often the "Coming Up" full-screen trip list appears (5 min)
 TRIP_LIST_DISPLAY_SECONDS = 60          # how long it stays up
 FLIGHT_REFRESH_SECONDS = 60    # how often to re-check a relevant flight's live/scheduled data (1 min)
 CALENDAR_CACHE_SECONDS = 24 * 60 * 60  # how long to reuse a fetched calendar before pulling fresh
